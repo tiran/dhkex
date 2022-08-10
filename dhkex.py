@@ -11,18 +11,45 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography import x509
 
+from pyasn1.type import constraint
+from pyasn1.type import namedtype
+from pyasn1.type import univ
+from pyasn1.codec.native.encoder import encode as native_encode
+from pyasn1.codec.native.decoder import decode as native_decode
+from pyasn1.codec.der.encoder import encode as der_encode
+from pyasn1.codec.der.decoder import decode as der_decode
+
 from testca import TestCA
+
+
+class InnerMessage(univ.Sequence):
+    componentType = namedtype.NamedTypes(
+        namedtype.NamedType(
+            "random",
+            univ.OctetString().subtype(
+                subtypeSpec=constraint.ValueSizeConstraint(32, 32)
+            ),
+        ),
+        namedtype.NamedType("dhpub", univ.OctetString()),
+        namedtype.OptionalNamedType("cert", univ.OctetString()),
+    )
+
+
+class OuterMessage(univ.Sequence):
+    componentType = namedtype.NamedTypes(
+        namedtype.NamedType("inner", univ.OctetString()),
+        namedtype.OptionalNamedType("signature", univ.OctetString()),
+    )
 
 
 class DHKEX:
     side = None
+    hash_algo = hashes.SHA256()
 
     def __init__(
         self, cert: x509.Certificate, privkey: rsa.RSAPrivateKey, ca: x509.Certificate
     ):
         self.cert = cert
-        # assumes both certs use same hash algos
-        self.hash_algo = cert.signature_hash_algorithm
         self.privkey = privkey
         self.ca = ca
         self.random = os.urandom(32)
@@ -53,29 +80,42 @@ class DHKEX:
         ).verify(self.shared_secret, message)
 
     def serialize_inner(self) -> bytes:
-        dh = self.dh_pubkey.public_bytes(
+        dhpub = self.dh_pubkey.public_bytes(
             encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
-        cert = self.cert.public_bytes(serialization.Encoding.DER)
-        size = struct.pack("!H", len(cert))
-        # TODO: better serialization format
-        return self.random + dh + size + cert
+        native = dict(random=self.random, dhpub=dhpub)
+        if self.cert:
+            cert = self.cert.public_bytes(serialization.Encoding.DER)
+            native.update(cert=cert)
+        asn1 = native_decode(native, InnerMessage())
+        return der_encode(asn1)
 
     def serialize_outer(self, inner, sig):
-        size = struct.pack("!H", len(inner))
-        # TODO: better serialization format
-        return size + inner + sig
+        native = dict(inner=inner)
+        if sig is not None:
+            native.update(signature=sig)
+        asn1 = native_decode(native, OuterMessage())
+        return der_encode(asn1)
 
     def deserialize_inner(self, data: bytes):
-        random = data[:32]
-        dh = x25519.X25519PublicKey.from_public_bytes(data[32:64])
-        size = struct.unpack("!H", data[64:66])[0]
-        cert = x509.load_der_x509_certificate(data[66 : 66 + size])
-        return random, dh, cert
+        asn1, trail = der_decode(data, InnerMessage())
+        if trail:
+            raise ValueError(trail)
+        native = native_encode(asn1)
+        dh = x25519.X25519PublicKey.from_public_bytes(native["dhpub"])
+        certder = native.get("cert")
+        if certder is not None:
+            cert = x509.load_der_x509_certificate(certder)
+        else:
+            cert = None
+        return native["random"], dh, cert
 
     def deserialize_outer(self, data: bytes):
-        size = struct.unpack("!H", data[:2])[0]
-        return data[2 : 2 + size], data[2 + size :]
+        asn1, trail = der_decode(data, OuterMessage())
+        if trail:
+            raise ValueError(trail)
+        native = native_encode(asn1)
+        return native["inner"], native.get("signature")
 
     def sign(self, message):
         if isinstance(self.privkey, rsa.RSAPrivateKey):
@@ -132,8 +172,10 @@ class DHKEXClient(DHKEX):
     def step1(self) -> bytes:
         client_inner = self.serialize_inner()
         self.client_hash = self.hash(client_inner)
-        # client_inner_hash = self.hash(client_inner)
-        client_sig = self.sign(client_inner)
+        if self.cert is not None:
+            client_sig = self.sign(client_inner)
+        else:
+            client_sig = None
         return self.serialize_outer(client_inner, client_sig)
 
     def step2(self, data: bytes) -> bytes:
@@ -155,8 +197,9 @@ class DHKEXServer(DHKEX):
     def step1(self, data: bytes) -> bytes:
         client_inner, client_sig = self.deserialize_outer(data)
         client_random, client_dhpub, client_cert = self.deserialize_inner(client_inner)
-        self.check_trust(client_cert)
-        self.verify(client_cert.public_key(), client_sig, client_inner)
+        if client_cert is not None:
+            self.check_trust(client_cert)
+            self.verify(client_cert.public_key(), client_sig, client_inner)
         self.client_hash = self.hash(client_inner)
 
         server_inner = self.serialize_inner()
@@ -171,22 +214,31 @@ class DHKEXServer(DHKEX):
 
 def demo():
     ca = TestCA()
-    cert, privkey = ca.create_certkey_pair(DHKEXClient.name)
-    client = DHKEXClient(cert, privkey, ca=ca.ca_cert)
 
-    cert, privkey = ca.create_certkey_pair(DHKEXServer.name)
-    server = DHKEXServer(cert, privkey, ca=ca.ca_cert)
+    client = DHKEXClient(None, None, ca=ca.ca_cert)
+
+    scert, sprivkey = ca.create_certkey_pair(DHKEXServer.name)
+    server = DHKEXServer(scert, sprivkey, ca=ca.ca_cert)
 
     data1 = client.step1()
     data2 = server.step1(data1)
     data3 = client.step2(data2)
-    # optional
-    server.step2(data3)
+    server.step2(data3)  # optional
 
     print(client.kdf_derive(b"key"))
     print(server.kdf_derive(b"key"))
 
-    return client, server
+    ccert, cprivkey = ca.create_certkey_pair(DHKEXClient.name)
+    client = DHKEXClient(ccert, cprivkey, ca=ca.ca_cert)
+    server = DHKEXServer(scert, sprivkey, ca=ca.ca_cert)
+
+    data1 = client.step1()
+    data2 = server.step1(data1)
+    data3 = client.step2(data2)
+    server.step2(data3)  # optional
+
+    print(client.kdf_derive(b"key"))
+    print(server.kdf_derive(b"key"))
 
 
 if __name__ == "__main__":
